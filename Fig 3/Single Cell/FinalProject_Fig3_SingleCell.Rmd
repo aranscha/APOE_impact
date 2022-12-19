@@ -1,0 +1,521 @@
+---
+title: "FinalProject_Fig3_SingleCell"
+output: html_document
+---
+
+This code is from the shared github repository by Ostendorf et al. but rearranged to perform and reproduce the same single cell analysis for figures 3e-g specifically:
+  Git: https://github.com/benostendorf/ostendorf_etal_2022
+  Paper: https://www.nature.com/articles/s41586-022-05344-2
+  
+Raw data files are included in the package here and originally obtained from:
+  https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE199498
+
+
+```{r setup, include=FALSE}
+library(Seurat)
+library(Matrix)
+library(ggpubr)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Mm.eg.db)
+library(msigdbr)
+library(ggrastr)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(tidyverse)
+
+source("code/helper_functions.R")
+source("code/scRNAseq_aux.R")
+knitr::opts_chunk$set(fig.retina = 3)
+```
+
+```{r} 
+
+## Import Data and Perform Seurat Workflow 
+# log-normalize, scale, PCA, UMAP (Louvain)
+
+if (!file.exists("data/Seurat.RDS")) {
+
+# Import data
+  
+mat <- readMM("data/DGE.mtx")
+cell_meta <- read.delim("data/cell_metadata.csv",
+                        stringsAsFactor = FALSE, sep = ",")
+genes <- read.delim("data/all_genes.csv",
+                    stringsAsFactor = FALSE, sep = ",")
+
+# Set row/col parameters and label the GE matrix
+cell_meta$bc_wells <- make.unique(cell_meta$bc_wells, sep = "_dup")
+rownames(cell_meta) <- cell_meta$bc_index
+genes$gene_name <- make.unique(genes$gene_name, sep = "_dup")
+colnames(mat) <- genes$gene_name
+rownames(mat) <- rownames(cell_meta)
+mat_t <- t(mat)
+
+# Remove empty rownames, if they exist
+mat_t <- mat_t[(rownames(mat_t) != ""), ]
+df_raw <- CreateSeuratObject(mat_t, min_cells = 2, meta.data = cell_meta)
+
+# Setting initial cell class to a single type (instead of plate well numbers), this will change after clustering. 
+df_raw@meta.data$orig.ident <- factor(rep("df", nrow(df_raw@meta.data)))
+Idents(df_raw) <- df_raw@meta.data$orig.ident
+
+# Add % mitochondrial reads, condition and genotype metadata
+df_raw[["condition"]] <- gsub("(w*)_\\d*_E\\d", "\\1", df_raw@meta.data$sample)
+df_raw[["genotype"]] <- gsub(".*_(E\\d)", "\\1", df_raw@meta.data$sample)
+df_raw[["percent.mt"]] <- PercentageFeatureSet(df_raw, pattern = "^mt-")
+
+# Perform subsetting & seurat
+
+## Define thresholds
+feature_min <- 150
+feature_max <- 7500
+count_max <- 40000
+max_perc <- 15
+
+# Subset
+df <- subset(df_raw, 
+             subset = 
+               nFeature_RNA > feature_min & nFeature_RNA < feature_max & 
+               nCount_RNA < count_max & 
+               percent.mt < max_perc)
+
+# Seurat workflow
+df <- NormalizeData(df)
+df <- FindVariableFeatures(df)
+df <- ScaleData(df)
+df <- RunPCA(df)
+df <- RunUMAP(df, dims = 1:30)
+ElbowPlot(df, ndims = 30)
+df <- FindNeighbors(df, dims = 1:30)
+df <- FindClusters(df, resolution = 1.4)
+
+df <- BuildClusterTree(df, reorder = TRUE, reorder.numeric = TRUE)
+
+saveRDS(df, "data/Seurat.RDS")
+}
+
+df <- readRDS("data/Seurat.RDS")
+```
+
+
+```{r}
+
+# Reorder & rename the clusters from running UMAP
+rename_clusters <- c(`1` = "Airway epithelial A", `2` = "Airway epithelial B", 
+                     `3` = "Granulocytes", `4` = "Myofibroblasts", 
+                     `5` = "Lipofibroblasts", `6` = "AT1", 
+                     `7` = "misc_01", `8` = "Ciliated cells", 
+                     `9` = "Mesothelial cells", `10` = "Pericytes", 
+                     `11` = "misc_02", `12` = "Col14a1pos fibroblasts", 
+                     `13` = "misc_06" , `14` = "Vcam1pos ECs A", 
+                     `15` = "NK cells", `16` = "B cells", 
+                     `17` = "T cells A", `18` = "T cells B", 
+                     `19` = "T cells C", `20` = "Neuronal", 
+                     `21` = "Capillary ECs", `22` = "Vascular ECs A", 
+                     `23` = "Other ECs", `24` = "Vcam1pos ECs B", 
+                     `25` = "Vascular ECs B", `26` = "misc_03", 
+                     `27` = "AT2", `28` = "Alveolar mø A", 
+                     `29` = "Alveolar mø B", `30` = "Alveolar mø prolif", 
+                     `31` = "DCs", `32` = "misc_04", `33` = "Monocytes A", 
+                     `34` = "Monocytes B", `35` = "Interstitial mø")
+
+df <- RenameIdents(object = df, rename_clusters)
+df$celltype <- Idents(object = df)
+
+# Re-cluster for T-cells
+T_cells <- subset(df, idents = c("T cells A", "T cells B", "T cells C"))
+T_cells <- FindVariableFeatures(T_cells)
+T_cells <- ScaleData(T_cells)
+T_cells <- RunPCA(T_cells)
+ElbowPlot(T_cells)
+T_cells <- RunUMAP(T_cells, dims = 1:20)
+T_cells <- FindNeighbors(T_cells, dims = 1:20)
+T_cells <- FindClusters(T_cells, resolution = 0.5)
+
+# Find DEG for T-cells
+markers_T_cells <- FindAllMarkers(T_cells, only.pos = TRUE, 
+                                  min.pct = 0.25, logfc.threshold = 0.25)
+ 
+markers_by_T_cells <- 
+  markers_T_cells |>
+  group_by(cluster) |>
+  slice_max(n = 5, order_by = avg_log2FC)
+
+T_cells.averages <- AverageExpression(T_cells, return.seurat = TRUE)
+
+# Rename the clusters for T-cells
+rename_clusters_T_cells <- c(`0` = "misc_05", `1` = "T cells", 
+                             `2` = "T cells naive", `3` = "Tregs", 
+                             `4` = "misc_05", `5` = "misc_05", 
+                             `6` = "misc_05", `7` = "T cells proliferating", 
+                             `8` = "misc_05", `9` = "misc_05")
+
+T_cells <- RenameIdents(object = T_cells, rename_clusters_T_cells)
+Idents(T_cells) <- factor(Idents(T_cells), 
+                     levels = levels(Idents(T_cells)), ordered = TRUE)
+T_cells$celltype <- Idents(object = T_cells)
+
+
+# Rename clusters in main DEG object
+df$sub_cluster <- as.character(Idents(df))
+df$sub_cluster[Cells(T_cells)] <- as.character(Idents(T_cells))
+Idents(df) <- df$sub_cluster
+df$celltype <- Idents(df)
+
+# Re-order clusters
+levels_clusters <- c("Alveolar mø A", "Alveolar mø B", 
+                     "Alveolar mø prolif", "Interstitial mø", 
+                     "Monocytes A", "Monocytes B", 
+                     "Granulocytes", "DCs", 
+                     "NK cells", 
+                     "T cells naive", "T cells", 
+                     "Tregs", "T cells proliferating", 
+                     "B cells", 
+                     "Myofibroblasts", "Lipofibroblasts" ,
+                     "Col14a1pos fibroblasts", 
+                     "Capillary ECs", "Vascular ECs A", 
+                     "Vascular ECs B", "Other ECs", 
+                     "Vcam1pos ECs A", "Vcam1pos ECs B", 
+                     "Pericytes", 
+                     "AT1", "AT2", 
+                     "Ciliated cells", 
+                     "Airway epithelial A", "Airway epithelial B", 
+                     "Mesothelial cells", 
+                     "Neuronal", 
+                     "misc_01", "misc_02", "misc_03", 
+                     "misc_04", "misc_05", "misc_06")
+
+Idents(df) <- factor(Idents(df),
+                     levels =  levels_clusters, 
+                     ordered = TRUE)
+
+saveRDS(df, "data/Seurat_processed.RDS")
+
+```
+
+```{r}
+
+# Find differentially expressed genes, this is a slow step (~20-30min)
+cluster.averages <- AverageExpression(object = df, return.seurat = TRUE)
+markers <- FindAllMarkers(df, only.pos = TRUE, min.pct = 0.25)
+saveRDS(markers, "data/diff_markers.RDS")
+
+```
+
+```{r}
+
+df <- readRDS("data/Seurat_processed.RDS")
+
+# Filter
+
+# Define clusters to filter
+clusters_to_filter <- grep("misc", levels(Idents(df)), value = TRUE)
+
+# Remove ambiguous clusters
+df_filt <- subset(df, idents = clusters_to_filter, 
+                  invert = TRUE)
+df_filt$celltype <- droplevels(df_filt$celltype)
+df_filt.averages <- AverageExpression(df_filt, return.seurat = TRUE)
+celltypes <- as.character(Idents(df_filt))
+
+# Group cell types
+df_filt$celltype_grouped <- case_when(grepl("Monocyte", celltypes) ~ "Monocytes",
+                                      grepl("Alveolar", celltypes) ~ "Alveolar Mø",
+                                      grepl("T cells", celltypes) ~ "T cells",
+                                      grepl("Fibro", celltypes, ignore.case = T) ~ "Fibroblasts",
+                                      grepl("ECs", celltypes) ~ "Endothelial",
+                                      grepl("AT1|AT2|epith|Meso|Cilia", celltypes) ~ "Epithelium", 
+                                      TRUE ~ celltypes)
+df_filt$celltype_grouped <- 
+  factor(df_filt$celltype_grouped, 
+         levels = c("Alveolar Mø", "Interstitial mø", "Monocytes", "Granulocytes", 
+                    "DCs", "NK cells", "T cells", "Tregs", 
+                    "B cells", "Endothelial", "Pericytes", "Fibroblasts", 
+                    "Epithelium", "Neuronal"), 
+         ordered = TRUE)
+
+saveRDS(df_filt, "data/df_filt.RDS")
+
+df_filt.averages <- AverageExpression(df_filt, return.seurat = TRUE)
+
+# Subset data
+
+df_inf <- subset(df_filt, condition == "inf")
+df_ctrl <- subset(df_filt, condition == "ctrl")
+
+# df_immune
+immune_subsets <- names(table(df_filt$celltype_grouped))[1:9]
+df_immune <- subset(df_filt, celltype_grouped %in% immune_subsets)
+df_immune$celltype_grouped <- droplevels(df_immune$celltype_grouped)
+df_immune$celltype <- droplevels(df_immune$celltype)
+
+# df_immune_inf
+df_immune_inf <- subset(df_filt, celltype_grouped %in% immune_subsets & condition == "inf")
+df_immune_inf$celltype_grouped <- droplevels(df_immune_inf$celltype_grouped)
+df_immune_inf$celltype <- droplevels(df_immune_inf$celltype)
+
+# df_nonimmune
+nonimmune_subsets <- names(table(df_filt$celltype_grouped))[10:14]
+df_nonimmune <- subset(df_filt, celltype_grouped %in% nonimmune_subsets)
+df_nonimmune$celltype_grouped <- droplevels(df_nonimmune$celltype_grouped)
+df_nonimmune$celltype <- droplevels(df_nonimmune$celltype)
+
+# df_nonimmune_inf
+df_nonimmune_inf <- subset(df_filt, celltype_grouped %in% nonimmune_subsets & condition == "inf")
+df_nonimmune_inf$celltype_grouped <- droplevels(df_nonimmune_inf$celltype_grouped)
+df_nonimmune_inf$celltype <- droplevels(df_nonimmune_inf$celltype)
+
+# Extract UMAP data for df_filt, df_inf, and df_ctrl
+extract_UMAP <- function(seurat_object){
+  UMAP <- as.data.frame(Embeddings(seurat_object, reduction = "umap"))
+  UMAP$genotype <- seurat_object$genotype
+  UMAP$celltype <- Idents(seurat_object)
+  UMAP$celltype_grouped <- seurat_object$celltype_grouped
+  UMAP$condition <- seurat_object$condition
+  return(UMAP)
+}
+UMAP_df_filt <- extract_UMAP(df_filt)
+UMAP_inf <- extract_UMAP(df_inf)
+UMAP_ctrl <- extract_UMAP(df_ctrl)
+
+```
+```{r}
+
+# Plot the clusters with cell type shown
+
+library(ggplot2)
+
+#pdf(file = 'UMAP_all.pdf')
+ggplot(data = UMAP_df_filt, aes(x = UMAP_1, y = UMAP_2, col = celltype_grouped)) +
+  geom_point() +
+  xlab("UMAP1") +
+  ylab("UMAP2")
+#dev.off()
+
+```
+## Reproducing figures 3e-f
+
+
+```{r}
+
+# Fig 3e
+
+#pdf(file = 'UMAP_condition.pdf')
+plot_density(UMAP_df_filt, "condition")
+#dev.off()
+
+# Fig 3f
+
+#pdf(file = 'UMAP_genotype.pdf')
+plot_density(UMAP_inf, "genotype")
+#dev.off()
+
+```
+
+
+```{r}
+# Prepare Fig 3g - Gene Set Enrichment Analysis
+
+# Calculate DGEA for infected cells across genotypes
+
+# Include all genes by setting parameters to `-Inf` for gene ranking
+
+Idents(df_inf) <- df_inf$celltype_grouped
+
+for (genotype in c("E2", "E4")) {
+
+  if (!(file.exists(paste0("data/DGEA_geneLists_", genotype, ".rds")))) {
+
+    if (!(file.exists(paste0("data/DGEA_", genotype, ".rds")))) {
+
+      DGEA_all_clusters <- vector("list", length = nlevels(df_inf))
+      names(DGEA_all_clusters) <- levels(df_inf)
+
+      for (cluster in levels(df_inf)) {
+        print(cluster)
+        DGEA_all_clusters[[cluster]] <-
+          FindMarkers(df_inf,
+                      group.by = "genotype",
+                      subset.ident = cluster,
+                      ident.1 = genotype,
+                      ident.2 = "E3",
+                      min.pct = -Inf,
+                      logfc.threshold = -Inf,
+                      min.diff.pct = -Inf
+          )
+        saveRDS(DGEA_all_clusters, paste0("data/DGEA_", genotype, ".rds"))
+      }
+    }
+
+    DGEA_all_clusters <- readRDS(paste0("data/DGEA_", genotype, ".rds"))
+    length(DGEA_all_clusters)
+
+
+    # Data wrangling
+
+    DGEA_all_clusters_ranked <- vector("list", length = length(DGEA_all_clusters))
+    names(DGEA_all_clusters_ranked) <- names(DGEA_all_clusters)
+
+    for (cluster in seq_along(names(DGEA_all_clusters))) {
+
+      DGEA_cluster_subset <- DGEA_all_clusters[[cluster]]
+
+      # Calculate ranking metric for GSEA
+      DGEA_cluster_subset$ranking_metric <-
+        -log10(DGEA_cluster_subset$p_val) / sign(DGEA_cluster_subset$avg_log2FC)
+      DGEA_cluster_subset <-
+        DGEA_cluster_subset[order(DGEA_cluster_subset$ranking_metric, decreasing = TRUE), ]
+
+      # Add Entrez ID
+      DGEA_cluster_subset$entrez <- AnnotationDbi::mapIds(org.Mm.eg.db,
+                                                          keys = rownames(DGEA_cluster_subset),
+                                                          column = "ENTREZID",
+                                                          keytype = "ALIAS",
+                                                          multiVals = "first")
+
+      geneList_cluster_subset <- DGEA_cluster_subset$ranking_metric
+      names(geneList_cluster_subset) <- DGEA_cluster_subset$entrez
+      geneList_cluster_subset <- geneList_cluster_subset[!(is.na(geneList_cluster_subset))]
+      geneList_cluster_subset <- geneList_cluster_subset[!duplicated(names(geneList_cluster_subset))]
+
+      DGEA_all_clusters_ranked[[cluster]] <- geneList_cluster_subset
+    }
+    saveRDS(DGEA_all_clusters_ranked, paste0("data/DGEA_geneLists_", genotype, ".rds"))
+  }
+}
+
+```
+
+```{r}
+
+# Plot Fig 3g
+
+clusters <- levels(df_inf)
+
+clusters_immune <- clusters[c(1:14)]
+clusters_fibroblasts <- clusters[c(15:17)]
+clusters_endothelial <- clusters[c(18:23)]
+clusters_epithelial <- clusters[c(25:30)]
+clusters_other <- clusters[c(24, 31)]
+
+# GSEA using hallmark pathways
+
+H_pathways_mm <- 
+  msigdbr(species = "Mus musculus", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene) %>%
+  mutate(gs_name = gsub("HALLMARK_", "", gs_name)) %>%
+  mutate(gs_name = gsub("_", " ", gs_name)) %>%
+  mutate(gs_name = str_to_sentence(gs_name))
+
+immune_hallmark <- levels(as.factor(H_pathways_mm$gs_name))[c(2, 4, 7, 10:11, 22:27, 42, 44, 45, 46, 49)]
+H_pathways_mm <- filter(H_pathways_mm, gs_name %in% immune_hallmark)
+
+for (genotype in c("E2", "E4")) {
+  
+  
+  # Run GSEA
+  
+  if (!(file.exists(paste0("data/gsea_hallmark_", genotype, ".rds")))) {
+    
+    DGEA_all_clusters_ranked <- readRDS(paste0("data/DGEA_geneLists_", genotype, ".rds"))
+    
+    gsea_all_clusters_H <- vector("list", length = length(DGEA_all_clusters_ranked))
+    names(gsea_all_clusters_H) <- names(DGEA_all_clusters_ranked)
+  
+    for (cluster in names(DGEA_all_clusters_ranked)) {
+      print(cluster)
+      gsea_cluster_H <- clusterProfiler::GSEA(DGEA_all_clusters_ranked[[cluster]], 
+                                              TERM2GENE = H_pathways_mm, 
+                                              nPerm = 10000,
+                                              pvalueCutoff = 0.1,
+                                              pAdjustMethod = "BH")
+  
+      gsea_cluster_H <- DOSE::setReadable(gsea_cluster_H, org.Mm.eg.db, keyType = "ENTREZID")
+      res_gsea_cluster_H <- as.data.frame(gsea_cluster_H)
+      gsea_all_clusters_H[[cluster]] <- res_gsea_cluster_H
+    }  
+    
+    saveRDS(gsea_all_clusters_H, paste0("data/gsea_hallmark_", genotype, ".rds"))
+  }
+  gsea_all_clusters_H <- readRDS(paste0("data/gsea_hallmark_", genotype, ".rds"))
+  length(gsea_all_clusters_H)
+  
+  gsea_all_clusters_H_red <- gsea_all_clusters_H[sapply(gsea_all_clusters_H, nrow) > 0]
+  
+  # Wrangle for plotting
+
+  gsea_all_clusters_H_mut <- vector("list", length(gsea_all_clusters_H_red))
+  names(gsea_all_clusters_H_mut) <- names(gsea_all_clusters_H_red)
+  for (cluster in names(gsea_all_clusters_H_red)) {
+    
+    # Wrangle output of GSEA for nicer plotting
+    gsea_cluster_count_H <- 
+      gsea_all_clusters_H_red[[cluster]] %>% 
+      group_by(ID) %>% 
+      summarise(count = sum(str_count(core_enrichment, "/")) + 1)
+    
+    gsea_cluster_H_df<- 
+      left_join(gsea_all_clusters_H_red[[cluster]], gsea_cluster_count_H, by = "ID") %>% 
+      mutate(GeneRatio = count/setSize ,
+             type = case_when(NES < 0 ~ "Suppressed", 
+                              NES > 0 ~ "Activated")) %>%
+      mutate(type = ordered(type))
+    
+    gsea_all_clusters_H_mut[[cluster]] <- gsea_cluster_H_df
+  }
+  
+  saveRDS(gsea_all_clusters_H_mut, paste0("data/GSEA_H_mut_", genotype, ".RDS"))
+}
+
+clusters <- levels(df_inf$celltype_grouped)
+
+
+for (genotype in c("E2", "E4")) {
+  
+  ls_gsea_H <- vector("list")
+  
+  gsea_all_clusters_H_mut <- readRDS(paste0("data/GSEA_H_mut_", genotype, ".RDS"))
+  
+  for (celltype in names(gsea_all_clusters_H_mut)){
+    df_for_each_cluster <- dplyr::select(gsea_all_clusters_H_mut[[celltype]], 
+                                  Description, enrichmentScore, p.adjust)
+    ls_gsea_H[[celltype]] <- df_for_each_cluster
+  }
+
+  df_gsea_H <- 
+    bind_rows(ls_gsea_H, .id = "cluster") %>%
+    pivot_wider(names_from = cluster, values_from = enrichmentScore, id_cols = Description)
+  
+  ## Add no hits to clusters with no significant pathway enrichment
+  missing_clusters <- clusters[!clusters %in% names(ls_gsea_H)]
+  missing_clusters_df <- data.frame(matrix(ncol = length(missing_clusters), 
+                                           nrow = nrow(df_gsea_H)))
+  rownames(missing_clusters_df) <- df_gsea_H$Description
+  colnames(missing_clusters_df) <- missing_clusters
+  df_gsea_h_combined <- 
+    as_tibble(missing_clusters_df, rownames = "Description") |>
+    full_join(df_gsea_H)
+  
+  df_gsea_h_combined <- as.data.frame(df_gsea_h_combined)
+  rownames(df_gsea_h_combined) <- df_gsea_h_combined$Description
+  
+  mtx_gsea_H <- as.matrix(df_gsea_h_combined[, clusters])
+  rownames(mtx_gsea_H) <- df_gsea_h_combined$Description
+  mtx_gsea_H[is.na(mtx_gsea_H)] <- 0
+  
+  #pdf(file = paste0("GSEA_H_mut_", genotype, ".pdf"))
+  print(
+    Heatmap(mtx_gsea_H, border = TRUE, 
+            show_row_dend = FALSE, show_column_dend = FALSE, cluster_columns = FALSE, 
+            row_names_gp = gpar(fontsize = 5), 
+            column_names_gp = gpar(fontsize = 5), 
+            col = circlize::colorRamp2(c(-1, 0, 1), 
+                                           c("blue", "grey 95", "red")), 
+            rect_gp = gpar(col = "white", lwd = 1), row_order = immune_hallmark, 
+            heatmap_legend_param = list(grid_width = unit(0.2, "cm"), 
+                                        legend_height = unit(0.4, "cm"))))
+  #dev.off()
+}
+
+```
