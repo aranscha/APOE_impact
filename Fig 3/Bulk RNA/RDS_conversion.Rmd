@@ -1,0 +1,295 @@
+---
+title: "RDS Conversion Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+adapted the example in https://alexslemonade.github.io/refinebio-examples/04-advanced-topics/network-analysis_rnaseq_01_wgcna.html
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+if (!("impute" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("impute")
+}
+
+if (!("preprocessCore" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("preprocessCore")
+}
+
+if (!("WGCNA" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("WGCNA")
+}
+
+if (!("DESeq2" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("DESeq2", update = FALSE)
+}
+
+if (!("ggforce" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("ggforce")
+}
+
+if (!("ComplexHeatmap" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("ComplexHeatmap")
+}
+
+library(DESeq2)
+library(WGCNA)
+library(magrittr)
+library(ggplot2)
+library(readr)
+library(limma)
+library(dplyr)
+```
+
+```{r}
+data = readRDS("GSE184287_dds.rds")
+```
+
+```{r}
+metadata <- as.data.frame(colData(data))
+counts <- as.data.frame(counts(data))
+```
+
+Now prepare the data for DESeq2
+
+```{r}
+counts_filtered <- round(counts) %>%
+  dplyr::filter(rowSums(.) >= 50) # todo: experiment with cutoff value
+
+cat(100*nrow(counts_filtered)/nrow(counts), '% of the data kept after filtering')
+print(nrow(counts))
+print(nrow(counts_filtered))
+```
+set up main experimental group variable (time or genotype)
+
+```{r}
+groupVar <- as.factor(metadata$genotype)
+```
+
+Create DESeqDataset from filtered count matrix (todo: different preprocessing method? same as author?)
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = counts_filtered, colData = metadata, design = ~1)
+dds_norm <- vst(dds)
+normalized_counts <- assay(dds_norm) %>% # format data for WGCNA
+  t()
+sft <- pickSoftThreshold(normalized_counts, dataIsExpr = TRUE, corFnc = cor, networkType = "signed")
+
+sft_df <- data.frame(sft$fitIndices) %>%
+  dplyr::mutate(model_fit = -sign(slope) * SFT.R.sq)
+sft_df
+```
+
+Plot power signed R^2 to be able to make a good decision on the power parameter (authors of original paper suggest > 0.8). It is good to pick a point at the infliction point, if multiple points satisfy the aforementioned condition.
+
+```{r}
+ggplot(sft_df, aes(x = Power, y = model_fit, label = Power)) +
+  # Plot the points
+  geom_point() +
+  # We'll put the Power labels slightly above the data points
+  geom_text(nudge_y = 0.1) +
+  # We will plot what WGCNA recommends as an R^2 cutoff
+  geom_hline(yintercept = 0.80, col = "red") +
+  # Just in case our values are low, we want to make sure we can still see the 0.80 level
+  ylim(c(min(sft_df$model_fit), 1.05)) +
+  # We can add more sensible labels for our axis
+  xlab("Soft Threshold (power)") +
+  ylab("Scale Free Topology Model Fit, signed R^2") +
+  # This adds some nicer aesthetics to our plot
+  theme_classic()
+```
+```{r}
+sft_df
+```
+
+```{r}
+bwnet <- blockwiseModules(normalized_counts,
+  maxBlockSize = 10000, # What size chunks (how many genes) the calculations should be run in (increase if you have a lot of RAM)
+  TOMType = "signed", # topological overlap matrix
+  power = 10, # soft threshold for network construction
+  numericLabels = TRUE, # Let's use numbers instead of colors for module labels
+  randomSeed = 1234, # there's some randomness associated with this calculation
+  # so we should set a seed
+)
+
+# write the results to a file
+readr::write_rds(bwnet,
+  file = file.path("GSE184287_wgcna_results.RDS")
+)
+```
+Some modules may have similar expression profiles, It is a good idea to merge these clusters (source: https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/FemaleLiver-02-networkConstr-man.pdf)
+
+```{r}
+module_eigengenes <- bwnet$MEs
+METree = hclust(as.dist(1-cor(module_eigengenes)), method = "average");
+plot(METree)
+thresh = 0.15 # empirically find a good cut (0.15 was found to be ok)
+abline(h=thresh, col="red")
+
+```
+Now select a threshold:
+
+```{r}
+merge <- mergeCloseModules(t(counts_filtered),bwnet$colors, cutHeight = thresh, verbose = 3)
+merge$newMEs
+```
+
+
+
+
+```{r}
+des_mat <- model.matrix(~ groupVar)
+
+fit <- limma::lmFit(t(module_eigengenes), design=des_mat)
+# Apply empirical Bayes to smooth standard errors
+fit <- limma::eBayes(fit)
+
+stats_df <- limma::topTable(fit, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+
+head(stats_df)
+```
+
+Now we will investigate the module-trait associations (https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/FemaleLiver-03-relateModsToExt.pdf)
+
+```{r}
+fun <- function(x){
+  substr(x, start=2, stop=2)
+}
+days <- as.numeric(lapply(metadata$timepoint, fun)) # convert categorical variable to a number to compute the correlation
+gentype <- recode(structure(metadata$genotype), "APOE2"=3.51, "APOE3"=1, "APOE4"=6.54) # replace genes by their hazard rates
+factors = cbind(gentype, days)
+moduleTraitCor <- cor(merge$newMEs, factors, use="p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, ncol(counts))
+moduleTraitCor
+```
+
+graphical representation from https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/FemaleLiver-03-relateModsToExt.pdf
+
+```{r}
+sizeGrWindow(15,6)
+# Will display correlations and their p-values
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                      signif(moduleTraitPvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(6, 8.5, 3, 3));
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = moduleTraitCor,
+  xLabels = list("genotype", "days"),
+  yLabels = names(merge$newMEs),
+  ySymbols = names(merge$newMEs),
+  colorLabels = FALSE,
+  colors = greenWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = 0.5,
+  zlim = c(-1,1),
+  main = paste("Module-trait relationships"))
+
+```
+
+```{r}
+df_colors <- as.data.frame(merge$colors)
+df_cluster <- subset(df_colors, `merge$colors`==14) # 14 is midnightblue and greenyellow, 22 is pink and black (black is also 0), 2 is yellow
+
+sort(rownames(df_cluster))
+```
+Pathway analysis, first convert gene names to Entrez IDs using the snippet from class:
+
+
+```{r}
+library(httr)
+library(data.table)
+
+GENE_SYM_ID_LINK_BASE <- "https://www.genenames.org/cgi-bin/download/custom?col=gd_app_sym&col=gd_pub_eg_id&status=Approved&hgnc_dbtag=on&order_by=gd_app_sym_sort&format=text&submit=submit"
+response <- GET(GENE_SYM_ID_LINK_BASE)
+gene_sym_id <- data.frame(fread(text=httr::content(response, "parsed"), header=TRUE))
+colnames(gene_sym_id) <- c("gene_symbol","gene_id")
+
+gene_sym_id <- gene_sym_id[apply(gene_sym_id == "", 1, sum) == 0,]
+gene_sym_id <- gene_sym_id[apply(is.na(gene_sym_id), 1, sum) == 0,]
+
+gene_sym_id <- gene_sym_id[!duplicated(gene_sym_id$gene_id), ]
+rownames(gene_sym_id) <- gene_sym_id$gene_symbol
+
+```
+
+Now do the actual pathway analysis
+
+```{r}
+library(ReactomePA)
+# cluster_ids
+cluster_ids <- gene_sym_id[toupper(rownames(df_cluster)), 'gene_id']
+
+ep <- enrichPathway(cluster_ids, pvalueCutoff = 0.05, readable = TRUE)
+head(ep)
+```
+```{r}
+apoe24 = metadata$genotype =='APOE2' | metadata$genotype == 'APOE4'
+```
+
+
+```{r}
+options(repr.plot_width=1)
+ggplot(
+  merge$newMEs,
+  aes(
+    x = days,
+    y = merge$newMEs[,'ME14'],
+    group=days
+  )
+) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.3) +
+  ylab("ME14")
+```
+
+```{r}
+options(repr.plot_width=1)
+ggplot(
+  merge$newMEs[days==4,],
+  aes(
+    x = !apoe24[days==4],
+    y = merge$newMEs[days==4,'ME14'],
+    group=apoe24[days==4]
+  )
+) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.3) +
+  ylab("ME14") + 
+  xlab("Genotype = APOE3") + 
+  ggtitle("day 4")
+```
+```{r}
+options(repr.plot_width=1)
+ggplot(
+  merge$newMEs[days==2,],
+  aes(
+    x = !apoe24[days==2],
+    y = merge$newMEs[days==2,'ME14'],
+    group=apoe24[days==2]
+  )
+) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.3) +
+  ylab("ME14") + 
+  xlab("Genotype = APOE3") + 
+  ggtitle("day 2")
+```
